@@ -1,0 +1,15 @@
+wsgi:
+    enabled: true
+    server: auto
+    host: 0.0.0.0
+    port: 8000
+    devmode: true
+    
+upload:
+    path: uploads 
+
+archive:
+    path: archive
+
+api:
+    routeprefix: http://api/test
