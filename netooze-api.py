@@ -1,27 +1,13 @@
 #!/usr/bin/env python
 
+# Core modules
 import os
 import sys
 import json
-import yaml
-import hashlib
 
+# Third-party modules
 from bottle import *
-from iocparser import iocp
-import customerror
-
-
-# Context manager
-class ListStream:
-    def __init__(self):
-        self.data = []
-    def write(self, s):
-        self.data.append(s)
-    def __enter__(self):
-        sys.stdout = self
-        return self
-    def __exit__(self, ext_type, exc_value, traceback):
-        sys.stdout = sys.__stdout__
+from pykafka import KafkaClient
 
 
 # API Exception wrapper for HTTPResponse
@@ -36,90 +22,80 @@ class APIError(Exception):
             body = { 'error': {'code':code,'message':message}}
         raise HTTPResponse(json.dumps(body), code, header)
 
-
-# Read configuration
-with open("config.yml", 'r') as ymlfile:
-    cfg = yaml.load(ymlfile)
-
-# Check upload path
-upldir = cfg['upload']['path']
-if upldir is None:
-    exit('Upload path is not defined in config file')
-if not os.path.exists(cfg['upload']['path']):
-    os.makedirs(upldir)
-
-# Check archive path
-arcdir = cfg['archive']['path']
-if arcdir is None:
-    exit('Archive path is not defined in config file')
-if not os.path.exists(cfg['archive']['path']):
-    os.makedirs(arcdir)
-
-# Check for route prefix
-apiprefix = cfg['api']['routeprefix']
-if apiprefix is None:
-    apiprefix = 'http://{}:{}/'.format(cfg['wsgi']['host'], cfg['wsgi']['port'])
+# Custom handling of 404
+def custom404(error):
+    msg = 'No endpoint resource found'
+    body = json.dumps({ 'error': { 'code': 404, 'message': msg }})
+    jsonheader = {'content-type': 'application/json'}
+    return HTTPResponse(body, 404, jsonheader)
 
 
-# Initiate the API with custom error handling
+# Custom handling of 405
+def custom405(error):
+    msg = 'Method not allowed'
+    body = json.dumps({ 'error': { 'code': 405, 'message': msg }})
+    jsonheader = {'content-type': 'application/json'}
+    return HTTPResponse(body, 405, jsonheader)
+
+
+# Custom handling of 500
+def custom500(error):
+    return 'this is a 500'
+
+def listjobs():
+    consumer = topic.get_simple_consumer(consumer_timeout_ms=1000)
+    jobs = {}
+    for job in consumer:
+        if job is not None:
+            jobs[job.offset] = job.value
+    return HTTPResponse(json.dumps(jobs), 200, {'content-type': 'application/json'})
+
+def getjob(id):
+    return "Job {}".format(id)
+
+def addjob():
+    return "Job added"
+
+def deljob(id):
+    return "Job {} deleted".format(id)
+
+def getdata(id):
+    return "Data for job {}: XXX".format(id)
+
+
+# Initiate the API 
 api = application = Bottle()
-api.error_handler = customerror.handlers
+api.error_handler = { 404: custom404, 405: custom405, 500: custom500 }
 
-# POST /v1/file
-# Handle file uploads from multipart/form-data POST requests
-@api.route('/v1/file', method='POST')
-def fileparse():
+# Try to locate the configuration file. 
+cfile = '{}.conf'.format(os.path.splitext(os.path.basename(__file__))[0])
+cdirs = ['.', '/etc', '/usr/local/etc']
+for d in cdirs:
+    config = '{}/{}'.format(d, cfile)
+    if os.path.isfile(config):
+        api.config.load_config(config)
 
-    upload = request.files.get('file')
-    if upload is None:
-        msg = "Unable to process data. Couldn't find form name 'file'"
-        raise APIError(400, msg)
+# Connect to kafka
+kafka = KafkaClient(hosts=api.config['kafka.hosts'])
+topic = kafka.topics[api.config['kafka.topic']]
 
-    name, ext = os.path.splitext(upload.filename)
-    if ext not in ('.pdf', '.txt', '.html'):
-        raise APIError(406, 'You can only upload pdf, txt or html files')
-
-    md5 = hashlib.md5(upload.file.getvalue()).hexdigest()
-    ref = apiprefix + '/v1/ioc/' + md5
-    if os.path.isfile('{}/{}'.format(arcdir, md5)):
-        msg = 'This file has already been uploaded'
-        raise APIError(409, msg, ref)
-
-    upload.save(upldir)
-
-    header = {'content-type': 'application/json'}
-    msg = 'File uploaded and queued for parsing'
-    body = { 'message': msg, 'href': ref }
-    return HTTPResponse(json.dumps(body), 201, header)
-
-# GET /v1/file/<id>
-# Return the original file 
-@api.route('/v1/file/<id>', method='GET')
-def getfile(id):
-
-    filepath = '{}/{}.json'.format(arcdir, id)
-    if os.path.isfile(filepath) is False:
-        raise APIError(404, 'No file found with that id')
-
-    with open(filepath) as data_file:
-        data = json.load(data_file)
-    origname = data['meta']['filename']
-
-    return static_file(origname, root=arcdir)
-
-# GET /v1/file
-# Return the collection of parsed files
-
-# GET /v1/ioc/<id>
-# Return the parsed IOCs from the file with id
+# Setup API routing
+api.route('/v1/jobs',      'GET',    listjobs)
+api.route('/v1/jobs',      'POST',   addjob)
+api.route('/v1/jobs/<id>', 'GET',    getjob)
+api.route('/v1/jobs/<id>', 'DELETE', deljob)
+api.route('/v1/data/<id>', 'GET',    getdata)
 
 # Run using WSGI server defined in config file if executed directly
 if __name__ == "__main__":
-    wsgi = cfg['wsgi']
-    if wsgi['enabled'] is True:
-        api.run( reloader=wsgi['devmode'],
-                 server=wsgi['server'],
-                 host=wsgi['host'],
-                 port=wsgi['port'] )
-    else:
-        exit('Enable WSGI in config, or run this using an external WSGI server')
+    try:
+        if api.config['wsgi.enabled']:
+            api.run(server=api.config['wsgi.server'],
+                    host=api.config['wsgi.host'],
+                    port=api.config['wsgi.port'],
+                    reloader=api.config['reloader'],
+                    debug=api.config['debug'])
+        else:
+            exit('Enable WSGI in config, or run app with external WSGI server')
+    except KeyError as e:
+        exit('Configuration missing setting for {} in {}'.format(e, cfile))
