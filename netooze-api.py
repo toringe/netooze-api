@@ -4,10 +4,16 @@
 import os
 import sys
 import json
+import getpass
+import logging
+from datetime import datetime
+from logging.handlers import SysLogHandler
 
 # Third-party modules
 from bottle import *
+from hashids import Hashids
 from pykafka import KafkaClient
+from elasticsearch import *
 
 
 # API Exception wrapper for HTTPResponse
@@ -17,15 +23,17 @@ class APIError(Exception):
         self.message = message
         header = {'content-type': 'application/json'}
         if link is not None:
-            body = { 'error': {'code':code,'message':message, 'href':link}}
+            body = {'error': {'code': code, 'message': message, 'href': link}}
         else:
-            body = { 'error': {'code':code,'message':message}}
+            body = {'error': {'code': code, 'message': message}}
         raise HTTPResponse(json.dumps(body), code, header)
 
+
+#TODO: Could try to use the error decorator instead..
 # Custom handling of 404
 def custom404(error):
     msg = 'No endpoint resource found'
-    body = json.dumps({ 'error': { 'code': 404, 'message': msg }})
+    body = json.dumps({'error': {'code': 404, 'message': msg}})
     jsonheader = {'content-type': 'application/json'}
     return HTTPResponse(body, 404, jsonheader)
 
@@ -33,7 +41,7 @@ def custom404(error):
 # Custom handling of 405
 def custom405(error):
     msg = 'Method not allowed'
-    body = json.dumps({ 'error': { 'code': 405, 'message': msg }})
+    body = json.dumps({'error': {'code': 405, 'message': msg}})
     jsonheader = {'content-type': 'application/json'}
     return HTTPResponse(body, 405, jsonheader)
 
@@ -42,58 +50,150 @@ def custom405(error):
 def custom500(error):
     return 'this is a 500'
 
-def listjobs():
-    consumer = topic.get_simple_consumer(consumer_timeout_ms=1000)
-    jobs = {}
-    for job in consumer:
-        if job is not None:
-            jobs[job.offset] = job.value
-    return HTTPResponse(json.dumps(jobs), 200, {'content-type': 'application/json'})
+
+def listjobs(user):
+    """ Get a list of all jobs for this user. Filtering can be done by
+        specifying a status.
+    """
+    return "hei"
+
 
 def getjob(id):
     return "Job {}".format(id)
 
-def addjob():
-    return "Job added"
 
-def deljob(id):
-    return "Job {} deleted".format(id)
+def addjob(user):
+    """ Create a new job spec for this user. This job details will be put in
+        Elasticsearch and the job-id in Kafka for further processing.
+        :user: Username as provided in the path of the POST request
+    """
+    # The following POST fields are mandatory so check that they are provided
+    reqfields = ['client', 'host', 'desc', 'query']
+    data = request.json
+    for field in reqfields:
+        if field not in data:
+            raise APIError(422, 'Missing required field: {}'.format(field))
+    try:
+        # All is ok. Increment document ID and try to insert into ES.
+        esid = es.count(indexname, user)['count'] + 1
+        job = {'id': esid,
+               'user': user,
+               'timestamp': datetime.now().isoformat(),
+               'client': data['client'],
+               'host': data['host'],
+               'desc': data['desc'],
+               'query': data['query'],
+               'status': 'queued'
+               }
+        res = es.create(indexname, user, job, esid)
+    except ElasticsearchException:
+        raise APIError(503, 'Connection to Elasticsearch failed')
+
+    if res['created']:
+        # Successful insert to ES. Now try to insert id to Kafka
+        kafkaid = '{}:{}'.format(user, esid)
+        print "before try"
+        try:
+            with topic.get_sync_producer() as producer:
+                print "before produce"
+                producer.produce(kafkaid)
+                print "after produce"
+        except:
+            errmsg = 'Kafka producer failed to insert into'
+            raise APIError(503, '{}: {}'.format(errmsg, topic.name))
+        print "after try"
+
+        # Finally return the job id to the user (a hashed representation)
+        response.status = 201
+        hashid = Hashids(salt=user)
+        hid = hashid.encode(esid)
+        message = {"id": hid, "desc": data['desc'], "status": "queued"}
+        print "before return message"
+        return message
+
+
+def deljob(user, id):
+    raise APIError(501, 'Deletion not yet implemented')
+
 
 def getdata(id):
-    return "Data for job {}: XXX".format(id)
+    raise APIError(501, 'Data retrival not yet implemented')
 
 
-# Initiate the API 
+# Who am I?
+appname = os.path.splitext(os.path.basename(__file__))[0]
+
+# Initiate the API
 api = application = Bottle()
-api.error_handler = { 404: custom404, 405: custom405, 500: custom500 }
+api.error_handler = {404: custom404, 405: custom405, 500: custom500}
 
-# Try to locate the configuration file. 
-cfile = '{}.conf'.format(os.path.splitext(os.path.basename(__file__))[0])
+# Try to locate the configuration file.
+cfile = '{}.conf'.format(appname)
 cdirs = ['.', '/etc', '/usr/local/etc']
 for d in cdirs:
     config = '{}/{}'.format(d, cfile)
     if os.path.isfile(config):
         api.config.load_config(config)
 
+# Log to local syslog
+logger = logging.getLogger(appname)
+logger.setLevel(logging.INFO)
+syslog = SysLogHandler(address='/dev/log')
+formatter = logging.Formatter('%(name)s: <%(levelname)s> -  %(message)s')
+syslog.setFormatter(formatter)
+logger.addHandler(syslog)
+
 # Connect to kafka
-kafka = KafkaClient(hosts=api.config['kafka.hosts'])
-topic = kafka.topics[api.config['kafka.topic']]
+kafkahosts = api.config['kafka.hosts']
+try:
+    print "before kafkaclient connect"
+    kafka = KafkaClient(hosts=kafkahosts)
+    print "after kafkaclient"
+except RuntimeError:
+    errmsg = 'Failed to connect to Kafka on {}'.format(kafkahosts)
+    logger.error(errmsg)
+    exit(errmsg)
+else:
+    logger.info('Connected to Kafka on {}'.format(kafkahosts))
+finally:
+    print "before topic selection"
+    topic = kafka.topics[api.config['kafka.topic']]
+    print "after topic"
+
+# Connect to elasticsearch
+eshosts = api.config['elasticsearch.hosts']
+es = Elasticsearch(eshosts.split())
+if not es.ping():
+    errmsg = 'Failed to connect to elasticsearch on {}'.format(eshosts)
+    logger.error(errmsg)
+    exit(errmsg)
+else:
+    logger.info('Connected to elasticsearch on {}'.format(eshosts))
+
+# Create index if not existing
+indexname = api.config['elasticsearch.index']
+if not es.indices.exists(indexname):
+    logger.warning('No elastic index found. Creating {}'.format(indexname))
+    custombody = {'settings': {
+                  'number_of_shards': api.config['elasticsearch.shards'],
+                  'number_of_replicas': api.config['elasticsearch.replicas']}}
+    es.indices.create(index=indexname, body=custombody)
 
 # Setup API routing
-api.route('/v1/jobs',      'GET',    listjobs)
-api.route('/v1/jobs',      'POST',   addjob)
-api.route('/v1/jobs/<id>', 'GET',    getjob)
-api.route('/v1/jobs/<id>', 'DELETE', deljob)
-api.route('/v1/data/<id>', 'GET',    getdata)
+api.route('/v1/jobs/<user>',            'GET',    listjobs)
+api.route('/v1/jobs/<user>',            'POST',   addjob)
+api.route('/v1/jobs/<user>/<id:int>',   'GET',    getjob)
+api.route('/v1/jobs/<user>/<id:int>',   'DELETE', deljob)
+api.route('/v1/data/<user>/<id:int>',   'GET',    getdata)
 
-# Run using WSGI server defined in config file if executed directly
 if __name__ == "__main__":
+    # App is running by itself, thus we need to have a WSGI server defined
+    # in our configuration file.
     try:
         if api.config['wsgi.enabled']:
             api.run(server=api.config['wsgi.server'],
                     host=api.config['wsgi.host'],
                     port=api.config['wsgi.port'],
-                    reloader=api.config['reloader'],
                     debug=api.config['debug'])
         else:
             exit('Enable WSGI in config, or run app with external WSGI server')
