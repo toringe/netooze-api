@@ -12,7 +12,7 @@ from logging.handlers import SysLogHandler
 # Third-party modules
 from bottle import *
 from hashids import Hashids
-from pykafka import KafkaClient
+from pykafka import KafkaClient, exceptions
 from elasticsearch import *
 
 
@@ -51,15 +51,42 @@ def custom500(error):
     return 'this is a 500'
 
 
-def listjobs(user):
-    """ Get a list of all jobs for this user. Filtering can be done by
-        specifying a status.
+def getjob(data):
+    """ Get meta data about jobs for the given user. Either a list of all
+        jobs for this user, or filtering can be done by providing a spesific
+        jobid or job status.
     """
-    return "hei"
+    # Split the input path: /jobs/<user>(/<id|finshed|queued>)
+    fields = data.rstrip('/').split('/')
+    user = fields[0]
+    hashids = Hashids(salt=user)
+    if len(fields) > 1:
+        # User has specified a filter, need to determine if its status or id
+        query = 'match'
+        if fields[1].lower() in ['finished', 'queued']:
+            key = 'status'
+            value = fields[1].lower()
+        else:
+            key = 'id'
+            value = hashids.decode(fields[1])[0]
+    else:
+        # User has not provided a filter, showing all jobs
+        query = 'wildcard'
+        key = 'status'
+        value = '*'
 
+    # Search in ES
+    search = {'query': {query: {key: value}}}
+    res = es.search(index=indexname, doc_type=user, body=search)
+    records = res['hits']['hits']
 
-def getjob(id):
-    return "Job {}".format(id)
+    # Create the json result returned to the user
+    jobs = {}
+    for rec in records:
+        r = rec['_source']
+        i = hashids.encode(r['id'])
+        jobs[i] = {'jobid': i, 'created': r['timestamp'], 'desc': r['desc']}
+    return jobs
 
 
 def addjob(user):
@@ -92,23 +119,19 @@ def addjob(user):
     if res['created']:
         # Successful insert to ES. Now try to insert id to Kafka
         kafkaid = '{}:{}'.format(user, esid)
-        print "before try"
         try:
-            with topic.get_sync_producer() as producer:
-                print "before produce"
-                producer.produce(kafkaid)
-                print "after produce"
-        except:
+            producer = topic.get_producer(min_queued_messages=1)
+            producer.produce(kafkaid)
+            producer.stop()
+        except KafkaException:
             errmsg = 'Kafka producer failed to insert into'
             raise APIError(503, '{}: {}'.format(errmsg, topic.name))
-        print "after try"
 
         # Finally return the job id to the user (a hashed representation)
         response.status = 201
         hashid = Hashids(salt=user)
         hid = hashid.encode(esid)
         message = {"id": hid, "desc": data['desc'], "status": "queued"}
-        print "before return message"
         return message
 
 
@@ -146,9 +169,7 @@ logger.addHandler(syslog)
 # Connect to kafka
 kafkahosts = api.config['kafka.hosts']
 try:
-    print "before kafkaclient connect"
     kafka = KafkaClient(hosts=kafkahosts)
-    print "after kafkaclient"
 except RuntimeError:
     errmsg = 'Failed to connect to Kafka on {}'.format(kafkahosts)
     logger.error(errmsg)
@@ -156,9 +177,7 @@ except RuntimeError:
 else:
     logger.info('Connected to Kafka on {}'.format(kafkahosts))
 finally:
-    print "before topic selection"
     topic = kafka.topics[api.config['kafka.topic']]
-    print "after topic"
 
 # Connect to elasticsearch
 eshosts = api.config['elasticsearch.hosts']
@@ -180,11 +199,10 @@ if not es.indices.exists(indexname):
     es.indices.create(index=indexname, body=custombody)
 
 # Setup API routing
-api.route('/v1/jobs/<user>',            'GET',    listjobs)
-api.route('/v1/jobs/<user>',            'POST',   addjob)
-api.route('/v1/jobs/<user>/<id:int>',   'GET',    getjob)
-api.route('/v1/jobs/<user>/<id:int>',   'DELETE', deljob)
-api.route('/v1/data/<user>/<id:int>',   'GET',    getdata)
+api.route('/v1/jobs/<data:path>',  'GET',    getjob)
+api.route('/v1/jobs/<user>',       'POST',   addjob)
+#api.route('/v1/jobs/<user>/<id>', 'DELETE', deljob)
+#api.route('/v1/data/<user>/<id>', 'GET',    getdata)
 
 if __name__ == "__main__":
     # App is running by itself, thus we need to have a WSGI server defined
