@@ -56,19 +56,24 @@ def getjob(data):
         jobs for this user, or filtering can be done by providing a spesific
         jobid or job status.
     """
-    # Split the input path: /jobs/<user>(/<id|finshed|queued>)
+    # Split the input path: /jobs/<user>(/<id|finshed|queued|processing>)
     fields = data.rstrip('/').split('/')
     user = fields[0]
     hashids = Hashids(salt=user)
     if len(fields) > 1:
         # User has specified a filter, need to determine if its status or id
         query = 'match'
-        if fields[1].lower() in ['finished', 'queued']:
+        f = fields[1]
+        if f.lower() in ['finished', 'queued', 'processing']:
             key = 'status'
-            value = fields[1].lower()
+            value = f.lower()
         else:
             key = 'id'
-            value = hashids.decode(fields[1])[0]
+            h = hashids.decode(f)
+            if len(h) == 0:
+                return APIError(404, 'No such job exists')
+            else:
+                value = h[0]
     else:
         # User has not provided a filter, showing all jobs
         query = 'wildcard'
@@ -79,14 +84,21 @@ def getjob(data):
     search = {'query': {query: {key: value}}}
     res = es.search(index=indexname, doc_type=user, body=search)
     records = res['hits']['hits']
+    if len(records) == 0:
+        return APIError(404, 'No such job exists')
 
     # Create the json result returned to the user
-    jobs = {}
-    for rec in records:
-        r = rec['_source']
-        i = hashids.encode(r['id'])
-        jobs[i] = {'jobid': i, 'created': r['timestamp'], 'desc': r['desc']}
-    return jobs
+    if key == 'id':
+        rec = records[0]['_source']
+        rec.pop('id')
+        return rec
+    else:
+        jobs = {}
+        for rec in records:
+            r = rec['_source']
+            i = hashids.encode(r['id'])
+            jobs[i] = {'jobid': i, 'created': r['timestamp'], 'desc': r['desc']}
+        return jobs
 
 
 def addjob(user):
@@ -148,7 +160,8 @@ appname = os.path.splitext(os.path.basename(__file__))[0]
 
 # Initiate the API
 api = application = Bottle()
-api.error_handler = {404: custom404, 405: custom405, 500: custom500}
+#api.error_handler = {404: custom404, 405: custom405, 500: custom500}
+api.error_handler = {404: custom404, 405: custom405}
 
 # Try to locate the configuration file.
 cfile = '{}.conf'.format(appname)
